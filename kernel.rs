@@ -169,7 +169,52 @@ impl Out {
     fn bytes(&mut self, p: *const u8, n: usize) {
         if self.pos + n <= self.cap {
             unsafe {
-                core::ptr::copy_nonoverlapping(p, self.ptr.add(self.pos), n);
+                let dst = self.ptr.add(self.pos);
+                if n == 0 {
+                    // nothing
+                } else if n <= 16 {
+                    // Branchless overlapping copy (classic memcpy tail trick):
+                    // two chunks cover [0, n) exactly, no loop, no per-byte
+                    // branches. The first store may write up to 7 scratch
+                    // bytes past pos+n; those sit at positions >= the new
+                    // out.pos and are overwritten by the next write before
+                    // ever being read (output is only read below out.pos).
+                    // Reads may run up to 7 bytes past the span end, still
+                    // inside the input buffer. Spans are ~2-15 bytes, so
+                    // this replaces ~709k memory.copy builtin calls.
+                    if n >= 8 {
+                        core::ptr::write_unaligned(
+                            dst as *mut u64,
+                            core::ptr::read_unaligned(p as *const u64),
+                        );
+                        core::ptr::write_unaligned(
+                            dst.add(n - 8) as *mut u64,
+                            core::ptr::read_unaligned(p.add(n - 8) as *const u64),
+                        );
+                    } else if n >= 4 {
+                        core::ptr::write_unaligned(
+                            dst as *mut u32,
+                            core::ptr::read_unaligned(p as *const u32),
+                        );
+                        core::ptr::write_unaligned(
+                            dst.add(n - 4) as *mut u32,
+                            core::ptr::read_unaligned(p.add(n - 4) as *const u32),
+                        );
+                    } else if n >= 2 {
+                        core::ptr::write_unaligned(
+                            dst as *mut u16,
+                            core::ptr::read_unaligned(p as *const u16),
+                        );
+                        core::ptr::write_unaligned(
+                            dst.add(n - 2) as *mut u16,
+                            core::ptr::read_unaligned(p.add(n - 2) as *const u16),
+                        );
+                    } else {
+                        *dst = *p;
+                    }
+                } else {
+                    core::ptr::copy_nonoverlapping(p, dst, n);
+                }
             }
             self.pos += n;
         } else {
