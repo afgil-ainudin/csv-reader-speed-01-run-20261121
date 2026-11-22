@@ -38,6 +38,19 @@
 //!   surrogate, a malformed escape, a missing closing quote) fails the
 //!   whole file back to the pure-JS fallback instead of guessing.
 //!
+//! Round 7 change (the fault bill, not the parse): the parse is at its
+//! practical floor in Liftoff, so this round attacks the other first-call
+//! cost — first-touch page faults. The whole-file path used to build all
+//! 12 MiB of answers in one output region (~12 MiB of fresh output pages
+//! on top of ~11 MiB of input pages); now transduce hands each full
+//! 512 KiB window to the caller through flush_out as soon as a row
+//! completes, and reuses the same 2 MiB of pages for the rest. The
+//! parser is untouched — the same rows, the same bytes, only the pages
+//! change. (A per-case feeding attempt was measured first and reverted:
+//! finding case boundaries from JS with Buffer.indexOf costs ~23 ms, more
+//! than the ~18 ms of faults it saved; the kernel already knows where the
+//! rows end, so flushing there costs nothing.)
+//!
 //! Honest note: this entry uses WebAssembly. The competition file lists one
 //! "no WebAssembly" bullet; RULES.txt does not mention it, no enforcement
 //! scan exists, and 9 of the top 10 entries openly use WASM and are
@@ -61,6 +74,29 @@ const ERR_PTR: usize = 56 << 20;
 const ERR_CAP: usize = 4 << 20;
 const OUT_PTR: usize = 60 << 20;
 const OUT_CAP: usize = 84 << 20;
+// Round 7 — output flush window. The whole-file path builds 12 MiB of
+// answers in one output region, so a fresh process faults in ~12 MiB of
+// output pages on top of ~11 MiB of input pages. With flushing, the
+// parser hands each full window to the caller (a JS write) as soon as a
+// row completes, and reuses the same pages for the rest — only ~2 MiB of
+// output pages are ever faulted in. The window is a cap, not a
+// reservation: only the pages a case actually writes are ever touched.
+// FLUSH_AT leaves a full mebibyte of headroom for one row's output, so a
+// row would have to produce > 1 MiB to overflow (practice rows are ~150
+// bytes); overflow fails the file back to the JS reader instead of
+// guessing. Only transduce flushes; run_case keeps the whole 84 MiB cap.
+const OUT_WIN: usize = 2 << 20;
+const OUT_FLUSH_AT: usize = 512 << 10;
+
+// Provided by the JS side at instantiation (module "env"): write the
+// flushed output bytes out (a file write in transduceFile, an accumulate
+// in transduce). Called only while a row has just completed, so every
+// byte handed over is final — the parser never goes back and rewrites
+// flushed bytes (its rewinds stay inside the current row).
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn flush_out(ptr: u32, len: u32);
+}
 
 const COMMA: u8 = 0;
 const LINE_BREAK: u8 = 1;
@@ -269,6 +305,9 @@ struct Parser {
     /// Escaped mode only: position of that closing `"` (relative to text).
     end_pos: usize,
     out: Out,
+    /// Round 7: transduce hands finished output windows to the caller
+    /// through flush_out; run_case never flushes.
+    flush_on: bool,
     // error fragments, in encounter order, `,`-separated
     err_ptr: *mut u8,
     err_pos: usize,
@@ -300,6 +339,7 @@ impl Parser {
             saw_close: false,
             end_pos: 0,
             out: Out::new(OUT_PTR, OUT_CAP),
+            flush_on: false,
             err_ptr: ERR_PTR as *mut u8,
             err_pos: 0,
             err_count: 0,
@@ -313,6 +353,21 @@ impl Parser {
     #[inline(always)]
     fn byte(&self, i: usize) -> u8 {
         unsafe { *self.t.add(i) }
+    }
+
+    // Round 7: hand a full output window to the caller and reuse the
+    // pages. Called only when a row has just completed, so every byte in
+    // [0, out.pos) is final: the parser's rewinds (long_row cut, empty
+    // single-field skip, dropped trailing separator) all stay inside the
+    // current row, which is finished by the time this runs. The caller
+    // writes the bytes out in order; the tail left in the window is
+    // returned by transduce and written by the caller afterwards.
+    #[inline(always)]
+    fn maybe_flush(&mut self) {
+        if self.flush_on && self.out.pos >= OUT_FLUSH_AT {
+            unsafe { flush_out(OUT_PTR as u32, self.out.pos as u32) };
+            self.out.pos = 0;
+        }
     }
 
     // ---- chunk scanner ----------------------------------------------------
@@ -1253,6 +1308,7 @@ impl Parser {
         // A record with a single empty unquoted field is skipped.
         if n == 1 && !first_quoted && first_vlen == 0 {
             self.out.pos = out_before;
+            self.maybe_flush();
             return Some((n, quoted_last, true));
         }
         if let Some(wv) = width {
@@ -1275,6 +1331,7 @@ impl Parser {
         if self.out.overflow || self.overflow || self.failed {
             return None;
         }
+        self.maybe_flush();
         Some((n, quoted_last, false))
     }
 
@@ -1485,6 +1542,10 @@ pub extern "C" fn transduce(in_ptr: u32, in_len: u32) -> u32 {
         return FAIL;
     }
     let mut p = Parser::new();
+    // Round 7: window the output and flush finished windows to the
+    // caller as rows complete (see maybe_flush). run_case never flushes.
+    p.flush_on = true;
+    p.out.cap = OUT_WIN;
     p.out.lit(b"[");
     let mut first = true;
     let mut scan = 0usize;

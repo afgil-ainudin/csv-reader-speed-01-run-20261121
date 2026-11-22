@@ -37,6 +37,15 @@
 // imported, exactly like --no-incremental-marking already was; the
 // house baseline's driver sets its flags the same way, and the rules
 // explicitly allow an entry to tune V8's flags too.
+//
+// Round 7 (output flush windows): the parse is at its floor, so this
+// round attacks the other first-call cost — first-touch page faults.
+// The whole-file path used to build all 12 MiB of answers in one output
+// region (~12 MiB of fresh output pages on top of ~11 MiB of input
+// pages); now the kernel hands each full 512 KiB window to the caller
+// through flush_out as soon as a row completes, and reuses the same
+// 2 MiB of pages for the rest. The kernel is otherwise unchanged, and
+// the flags above are unchanged; the entry still parses once and exits.
 
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
