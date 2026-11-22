@@ -1,0 +1,3 @@
+# Build artifact: the compiled WASM is embedded as base64 in solve.js, so the
+# binary itself is not part of the entry (kept out to stay "source JS").
+kernel.wasm
