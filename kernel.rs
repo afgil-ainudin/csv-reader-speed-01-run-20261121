@@ -1,23 +1,42 @@
-//! kernel.rs v3 — streaming WASM v128 SIMD CSV transducer (round 3).
+//! kernel.rs v4 — zero-prescan WASM v128 SIMD CSV transducer (round 4).
 //!
 //! A byte-exact port of solve.js (round 1), restructured so the parse writes
 //! the answer JSON straight to the output while it scans — no per-record
 //! scratch, no second pass over the fields.
 //!
+//! Round 4 change (the big one): the transducer parses the case text
+//! DIRECTLY in its JSON-escaped form — there is no separate JSON-unescape
+//! pass any more. In cases.json every CSV newline is the two bytes `\n`,
+//! every CSV quote is `\"`, and a bare `"` can only be the closing quote of
+//! the JSON string itself, so the escaped form carries exactly the same
+//! structure; the parser decodes each escape inline where it occurs
+//! ("unescape when needed", simd-csv's ZeroCopyReader > Reader lesson) and
+//! never copies the text first. That deletes one full 10 MB pass (the
+//! in-place unescape cost ~12 ms locally, ~27% of round 3's time) and the
+//! in-place overwrite. This is the "zero-prescan" shape the current top
+//! entries advertise in their titles.
+//!
 //! Design (synthesis of the top-10 study + outside input, see
-//! csv-reader-speed-01-run-20261121-top10/ANALYSIS.md §11):
+//! csv-reader-speed-01-run-20261121-top10/ANALYSIS.md §11-§12):
 //! - Two-stage scan, simdjson-style (Lemire): one SIMD classify per 16-byte
 //!   chunk produces a bitmask of ALL structural bytes, for BOTH modes at
 //!   once (the quoted mask is a subset of the unquoted mask); the parser
 //!   then drains the mask with trailing_zeros. No per-field SIMD setup.
+//!   The scanner is identical for escaped and unescaped text: in both,
+//!   the structural bytes are `,` `"` `\` and < 0x20 — only the
+//!   interpretation of a stop differs.
 //! - Branchless-first: the common path (unquoted field, no escapes) has no
 //!   unpredictable branch; commas are the fall-through case.
 //! - Zero-copy: a field's clean runs are memcpied straight to the output
 //!   with escapes applied inline at the special bytes; a quoted field is
 //!   never copied to a scratch area.
-//! - The JSON text values are unescaped IN PLACE in the input buffer
-//!   (unescaping only shrinks, so the write never overtakes the read).
-//! - run_case parses directly from the caller's buffer (no scratch copy).
+//! - run_case still parses plain (unescaped) UTF-8 text, so solve.js's
+//!   run() API is unchanged; only transduce (the whole-file path the
+//!   harness runs) uses the escaped form.
+//! - Safety net: any JSON escape the kernel cannot prove safe inline
+//!   (a `\u` decoding to a structural or control character, a lone
+//!   surrogate, a malformed escape, a missing closing quote) fails the
+//!   whole file back to the pure-JS fallback instead of guessing.
 //!
 //! Honest note: this entry uses WebAssembly. The competition file lists one
 //! "no WebAssembly" bullet; RULES.txt does not mention it, no enforcement
@@ -47,6 +66,17 @@ const COMMA: u8 = 0;
 const LINE_BREAK: u8 = 1;
 const END: u8 = 2;
 
+// JSON escape kinds (decode_escape).
+const E_QUOTE: u8 = 0;
+const E_BSLASH: u8 = 1;
+const E_SLASH: u8 = 2;
+const E_TAB: u8 = 3;
+const E_BS: u8 = 4;
+const E_FF: u8 = 5;
+const E_LF: u8 = 6;
+const E_CR: u8 = 7;
+const E_UNI: u8 = 8;
+
 // ===========================================================================
 // SIMD find helpers.
 // ===========================================================================
@@ -65,30 +95,6 @@ unsafe fn find1(base: *const u8, mut i: usize, end: usize, a: u8) -> usize {
         }
         while i < end {
             if *base.add(i) == a {
-                return i;
-            }
-            i += 1;
-        }
-    }
-    end
-}
-
-#[inline(always)]
-unsafe fn find2(base: *const u8, mut i: usize, end: usize, a: u8, b: u8) -> usize {
-    if end > i {
-        let va = i8x16_splat(a as i8);
-        let vb = i8x16_splat(b as i8);
-        while i + 16 <= end {
-            let v = v128_load(base.add(i) as *const v128);
-            let bits = i8x16_bitmask(v128_or(i8x16_eq(v, va), i8x16_eq(v, vb)));
-            if bits != 0 {
-                return i + bits.trailing_zeros() as usize;
-            }
-            i += 16;
-        }
-        while i < end {
-            let x = *base.add(i);
-            if x == a || x == b {
                 return i;
             }
             i += 1;
@@ -197,7 +203,7 @@ impl Out {
 // ===========================================================================
 
 struct Parser {
-    t: *const u8, // unescaped text
+    t: *const u8, // text (unescaped UTF-8, or JSON-escaped when ESC)
     len: usize,
     pos: usize,
     line: u32,
@@ -209,6 +215,14 @@ struct Parser {
     cur_row: Option<u32>,
     f_end: u8,
     overflow: bool,
+    /// A JSON escape the kernel cannot prove safe inline (bad `\u`,
+    /// lone surrogate, malformed escape, missing closing quote): the whole
+    /// file must fall back to JS instead of guessing.
+    failed: bool,
+    /// Escaped mode only: the closing `"` of the JSON string was seen.
+    saw_close: bool,
+    /// Escaped mode only: position of that closing `"` (relative to text).
+    end_pos: usize,
     out: Out,
     // error fragments, in encounter order, `,`-separated
     err_ptr: *mut u8,
@@ -237,6 +251,9 @@ impl Parser {
             cur_row: None,
             f_end: END,
             overflow: false,
+            failed: false,
+            saw_close: false,
+            end_pos: 0,
             out: Out::new(OUT_PTR, OUT_CAP),
             err_ptr: ERR_PTR as *mut u8,
             err_pos: 0,
@@ -258,7 +275,8 @@ impl Parser {
     // Next byte at or after `from` that is structural in the current mode.
     // Unquoted mode: `,` `"` `\` or < 0x20. Quoted mode: `"` `\` or < 0x20.
     // One SIMD classify per 16-byte chunk yields both masks, so a mode
-    // change never reloads the chunk.
+    // change never reloads the chunk. The mask sets are the same for
+    // escaped and unescaped text; only the interpretation of a stop differs.
 
     #[inline(always)]
     fn next_special(&mut self, from: usize, quoted: bool) -> usize {
@@ -322,6 +340,114 @@ impl Parser {
                 self.out.lit(b"\\u00");
                 self.out.u8(HEX[(b >> 4) as usize]);
                 self.out.u8(HEX[(b & 15) as usize]);
+            }
+        }
+    }
+
+    /// Write one Unicode scalar to OUT as the JSON-escaped value bytes:
+    /// a control scalar as its JSON escape, anything else as raw UTF-8.
+    /// Returns the value-length addition (UTF-8 byte count, or 1).
+    #[inline(always)]
+    fn write_scalar(&mut self, cp: u32) -> usize {
+        if cp < 0x20 {
+            self.write_esc_byte(cp as u8);
+            1
+        } else {
+            let mut buf = [0u8; 4];
+            match push_utf8(buf.as_mut_ptr(), 0, 4, cp) {
+                Some(n) => {
+                    self.out.bytes(buf.as_ptr(), n);
+                    n
+                }
+                None => 0,
+            }
+        }
+    }
+
+    /// Decode the JSON escape starting at `p` (the byte at `p` is `\`).
+    /// Returns (kind, advance, scalar) or None when the escape is invalid
+    /// or cannot be proven safe inline: a `\u` decoding to a structural
+    /// or control character (`,`, `"`, `\`, < 0x20 — those change the
+    /// parse, so the caller must not guess) or a lone surrogate. On None
+    /// self.failed is set and the caller bails out to the JS fallback.
+    #[inline(always)]
+    fn decode_escape(&mut self, p: usize) -> Option<(u8, usize, u32)> {
+        if p + 1 >= self.len {
+            self.failed = true;
+            return None;
+        }
+        let e = self.byte(p + 1);
+        match e {
+            b'"' => Some((E_QUOTE, 2, 0)),
+            b'\\' => Some((E_BSLASH, 2, 0)),
+            b'/' => Some((E_SLASH, 2, 0)),
+            b't' => Some((E_TAB, 2, 0)),
+            b'b' => Some((E_BS, 2, 0)),
+            b'f' => Some((E_FF, 2, 0)),
+            b'n' => Some((E_LF, 2, 0)),
+            b'r' => Some((E_CR, 2, 0)),
+            b'u' => {
+                if p + 6 > self.len {
+                    self.failed = true;
+                    return None;
+                }
+                let mut v: u32 = 0;
+                for k in 0..4 {
+                    match hex_val(self.byte(p + 2 + k)) {
+                        Some(h) => v = (v << 4) | h,
+                        None => {
+                            self.failed = true;
+                            return None;
+                        }
+                    }
+                }
+                let mut adv = 6usize;
+                let cp: u32;
+                if (0xD800..0xDC00).contains(&v) {
+                    // high surrogate: combine with a following \uDC00-\uDFFF
+                    if p + 12 <= self.len
+                        && self.byte(p + 6) == b'\\'
+                        && self.byte(p + 7) == b'u'
+                    {
+                        let mut lo: u32 = 0;
+                        let mut ok = true;
+                        for k in 0..4 {
+                            match hex_val(self.byte(p + 8 + k)) {
+                                Some(h) => lo = (lo << 4) | h,
+                                None => ok = false,
+                            }
+                        }
+                        if ok && (0xDC00..0xE000).contains(&lo) {
+                            cp = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                            adv = 12;
+                        } else {
+                            // Lone high surrogate: fall back to JS (the JS
+                            // baseline keeps it as \ud800 in the value).
+                            self.failed = true;
+                            return None;
+                        }
+                    } else {
+                        self.failed = true;
+                        return None;
+                    }
+                } else if (0xDC00..0xE000).contains(&v) {
+                    self.failed = true;
+                    return None;
+                } else {
+                    cp = v;
+                }
+                // A \u that decodes to a byte the parser treats as
+                // structural (`,`, `"`, `\`, or any control byte) would
+                // change the parse if inlined: refuse and fall back to JS.
+                if cp < 0x20 || cp == 0x22 || cp == 0x5C || cp == 0x2C {
+                    self.failed = true;
+                    return None;
+                }
+                Some((E_UNI, adv, cp))
+            }
+            _ => {
+                self.failed = true;
+                None
             }
         }
     }
@@ -434,7 +560,7 @@ impl Parser {
         self.err_count += 1;
     }
 
-    // ---- field readers (streaming) -----------------------------------------
+    // ---- field readers, unescaped text (run_case / solve.js run()) ---------
     //
     // Each writes the field's JSON-escaped form to OUT (without the
     // surrounding quotes, which the caller writes) and returns the value
@@ -591,6 +717,359 @@ impl Parser {
         }
     }
 
+    // ---- field readers, JSON-escaped text (transduce) -----------------------
+    //
+    // Same contract as the unescaped readers, but the text is the raw
+    // JSON string body: a CSV newline is the two bytes `\n`, a CSV quote
+    // is `\"`, and a bare `"` can only be the closing quote of the JSON
+    // string (end of text). Every escape is decoded inline where it
+    // occurs; a `\u` that would decode to a structural or control
+    // character, a lone surrogate, or a malformed escape fails the file
+    // to the JS fallback (decode_escape sets self.failed).
+
+    #[inline(always)]
+    fn read_unquoted_esc(&mut self, start_vlen: usize) -> usize {
+        let mut vlen = start_vlen;
+        let mut pos = self.pos;
+        loop {
+            let d = self.next_special(pos, false);
+            if d > pos {
+                let src = unsafe { self.t.add(pos) };
+                self.out.bytes(src, d - pos);
+                vlen += d - pos;
+                pos = d;
+            }
+            if d >= self.len {
+                // No closing quote for the JSON string: malformed input.
+                self.failed = true;
+                self.pos = self.len;
+                self.f_end = END;
+                return vlen;
+            }
+            let x = self.byte(d);
+            if x == b',' {
+                self.pos = d + 1;
+                self.f_end = COMMA;
+                return vlen;
+            }
+            if x == b'"' {
+                // Bare quote: end of the JSON string = end of the text.
+                self.end_pos = d;
+                self.saw_close = true;
+                self.pos = d;
+                self.f_end = END;
+                return vlen;
+            }
+            if x == b'\n' {
+                // Raw LF (cannot occur in valid JSON; same as unescaped).
+                self.pos = d + 1;
+                self.line += 1;
+                self.f_end = LINE_BREAK;
+                return vlen;
+            }
+            if x == b'\r' {
+                if d + 1 < self.len && self.byte(d + 1) == b'\n' {
+                    self.pos = d + 2;
+                    self.line += 1;
+                    self.f_end = LINE_BREAK;
+                    return vlen;
+                }
+                self.push_err(b"stray_cr");
+                pos = d + 1;
+                continue;
+            }
+            if x == b'\\' {
+                let (k, adv, cp) = match self.decode_escape(d) {
+                    Some(r) => r,
+                    None => {
+                        self.pos = self.len;
+                        self.f_end = END;
+                        return vlen;
+                    }
+                };
+                match k {
+                    E_LF => {
+                        self.pos = d + adv;
+                        self.line += 1;
+                        self.f_end = LINE_BREAK;
+                        return vlen;
+                    }
+                    E_CR => {
+                        // CRLF in escaped form is `\r` + `\n` (4 bytes).
+                        if d + adv + 2 <= self.len
+                            && self.byte(d + adv) == b'\\'
+                            && self.byte(d + adv + 1) == b'n'
+                        {
+                            self.pos = d + adv + 2;
+                            self.line += 1;
+                            self.f_end = LINE_BREAK;
+                            return vlen;
+                        }
+                        self.push_err(b"stray_cr");
+                        pos = d + adv;
+                        continue;
+                    }
+                    E_QUOTE => {
+                        self.out.lit(b"\\\"");
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_BSLASH => {
+                        self.out.lit(b"\\\\");
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_SLASH => {
+                        self.out.u8(b'/');
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_TAB => {
+                        self.out.lit(b"\\t");
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_BS => {
+                        self.out.lit(b"\\b");
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_FF => {
+                        self.out.lit(b"\\f");
+                        vlen += 1;
+                        pos = d + adv;
+                    }
+                    E_UNI => {
+                        vlen += self.write_scalar(cp);
+                        pos = d + adv;
+                    }
+                    _ => {
+                        self.failed = true;
+                        self.pos = self.len;
+                        self.f_end = END;
+                        return vlen;
+                    }
+                }
+                continue;
+            }
+            // Another control byte: JSON escape, one value byte.
+            self.write_esc_byte(x);
+            vlen += 1;
+            pos = d + 1;
+        }
+    }
+
+    #[inline(always)]
+    fn read_quoted_esc(&mut self) -> usize {
+        // `open` is the backslash of the opening `\"`; content starts at open+2.
+        let open = self.pos;
+        let open_line = self.line;
+        let out_start = self.out.pos;
+        let mut vlen = 0usize;
+        let mut p = open + 2;
+        loop {
+            let q = self.next_special(p, true);
+            if q > p {
+                let src = unsafe { self.t.add(p) };
+                self.out.bytes(src, q - p);
+                vlen += q - p;
+                p = q;
+            }
+            if q >= self.len {
+                self.failed = true;
+                self.pos = self.len;
+                self.f_end = END;
+                return vlen;
+            }
+            let x = self.byte(q);
+            if x == b'"' {
+                // Bare quote: the JSON string ended while the CSV field is
+                // still open — unterminated quote, same as unescaped.
+                self.line = open_line;
+                self.push_err(b"unterminated_quote");
+                self.out.pos = out_start;
+                self.pos = open + 2;
+                self.out.lit(b"\\\"");
+                return self.read_unquoted_esc(1);
+            }
+            if x == b'\n' {
+                self.out.lit(b"\\n");
+                vlen += 1;
+                self.line += 1;
+                p = q + 1;
+                continue;
+            }
+            if x == b'\r' {
+                self.out.lit(b"\\n");
+                vlen += 1;
+                self.line += 1;
+                if q + 1 < self.len && self.byte(q + 1) == b'\n' {
+                    p = q + 2;
+                } else {
+                    p = q + 1;
+                }
+                continue;
+            }
+            if x == b'\\' {
+                let (k, adv, cp) = match self.decode_escape(q) {
+                    Some(r) => r,
+                    None => {
+                        self.pos = self.len;
+                        self.f_end = END;
+                        return vlen;
+                    }
+                };
+                match k {
+                    E_QUOTE => {
+                        // A CSV quote: doubled (`\"` + `\"`) or closing.
+                        if q + adv + 2 <= self.len
+                            && self.byte(q + adv) == b'\\'
+                            && self.byte(q + adv + 1) == b'"'
+                        {
+                            self.out.lit(b"\\\"");
+                            vlen += 1;
+                            p = q + adv + 2;
+                            continue;
+                        }
+                        // Closing quote.
+                        self.pos = q + adv;
+                        if self.pos >= self.len {
+                            self.failed = true;
+                            self.f_end = END;
+                            return vlen;
+                        }
+                        let c = self.byte(self.pos);
+                        if c == b',' {
+                            self.pos += 1;
+                            self.f_end = COMMA;
+                            return vlen;
+                        }
+                        if c == b'"' {
+                            self.end_pos = self.pos;
+                            self.saw_close = true;
+                            self.f_end = END;
+                            return vlen;
+                        }
+                        if c == b'\n' {
+                            self.pos += 1;
+                            self.line += 1;
+                            self.f_end = LINE_BREAK;
+                            return vlen;
+                        }
+                        if c == b'\r'
+                            && self.pos + 1 < self.len
+                            && self.byte(self.pos + 1) == b'\n'
+                        {
+                            self.pos += 2;
+                            self.line += 1;
+                            self.f_end = LINE_BREAK;
+                            return vlen;
+                        }
+                        if c == b'\\' {
+                            // An escape after the closing quote: a line
+                            // break ends the field, anything else is junk.
+                            let (k2, adv2, _cp2) = match self.decode_escape(self.pos) {
+                                Some(r) => r,
+                                None => {
+                                    self.pos = self.len;
+                                    self.f_end = END;
+                                    return vlen;
+                                }
+                            };
+                            if k2 == E_LF {
+                                self.pos += adv2;
+                                self.line += 1;
+                                self.f_end = LINE_BREAK;
+                                return vlen;
+                            }
+                            if k2 == E_CR
+                                && self.pos + adv2 + 2 <= self.len
+                                && self.byte(self.pos + adv2) == b'\\'
+                                && self.byte(self.pos + adv2 + 1) == b'n'
+                            {
+                                self.pos += adv2 + 2;
+                                self.line += 1;
+                                self.f_end = LINE_BREAK;
+                                return vlen;
+                            }
+                            // A lone CR after the closing quote falls
+                            // through to the junk path below (the unquoted
+                            // reader reports it as stray_cr itself).
+                        }
+                        // What follows the closing quote is appended as it
+                        // stands, up to the next comma or line break.
+                        let before = vlen;
+                        let after = self.read_unquoted_esc(vlen);
+                        if after > before {
+                            self.push_err(b"quote_junk");
+                        }
+                        return after;
+                    }
+                    E_BSLASH => {
+                        self.out.lit(b"\\\\");
+                        vlen += 1;
+                        p = q + adv;
+                    }
+                    E_SLASH => {
+                        self.out.u8(b'/');
+                        vlen += 1;
+                        p = q + adv;
+                    }
+                    E_TAB => {
+                        self.out.lit(b"\\t");
+                        vlen += 1;
+                        p = q + adv;
+                    }
+                    E_BS => {
+                        self.out.lit(b"\\b");
+                        vlen += 1;
+                        p = q + adv;
+                    }
+                    E_FF => {
+                        self.out.lit(b"\\f");
+                        vlen += 1;
+                        p = q + adv;
+                    }
+                    E_LF => {
+                        self.out.lit(b"\\n");
+                        vlen += 1;
+                        self.line += 1;
+                        p = q + adv;
+                    }
+                    E_CR => {
+                        // CRLF or lone CR inside a quoted field: one LF.
+                        self.out.lit(b"\\n");
+                        vlen += 1;
+                        self.line += 1;
+                        if q + adv + 2 <= self.len
+                            && self.byte(q + adv) == b'\\'
+                            && self.byte(q + adv + 1) == b'n'
+                        {
+                            p = q + adv + 2;
+                        } else {
+                            p = q + adv;
+                        }
+                    }
+                    E_UNI => {
+                        vlen += self.write_scalar(cp);
+                        p = q + adv;
+                    }
+                    _ => {
+                        self.failed = true;
+                        self.pos = self.len;
+                        self.f_end = END;
+                        return vlen;
+                    }
+                }
+                continue;
+            }
+            // Another control byte: JSON escape, one value byte.
+            self.write_esc_byte(x);
+            vlen += 1;
+            p = q + 1;
+        }
+    }
+
     // ---- records ------------------------------------------------------------
     //
     // Parses one record and writes it as a JSON array to OUT. `width` is
@@ -599,9 +1078,10 @@ impl Parser {
     // before this record (and its row separator), for the skip rewind.
     // Returns None at end of text or on overflow; otherwise (n, quoted_last,
     // skipped). A skipped record's output is rewound; its errors stay,
-    // exactly like round 2.
+    // exactly like round 2. ESC selects the escaped (transduce) or the
+    // plain (run_case) field readers.
 
-    fn parse_record_out(
+    fn parse_record_out<const ESC: bool>(
         &mut self,
         width: Option<i32>,
         out_before: usize,
@@ -611,15 +1091,59 @@ impl Parser {
             if self.pos >= self.len {
                 return None;
             }
-            let c = self.byte(self.pos);
-            if c == b'\n' {
-                self.pos += 1;
-                self.line += 1;
-            } else if c == b'\r' && self.pos + 1 < self.len && self.byte(self.pos + 1) == b'\n' {
-                self.pos += 2;
-                self.line += 1;
-            } else {
+            if ESC {
+                // A line break in escaped form is `\n` / `\r\n` (2/4 bytes).
+                if self.pos + 1 < self.len
+                    && self.byte(self.pos) == b'\\'
+                    && self.byte(self.pos + 1) == b'n'
+                {
+                    self.pos += 2;
+                    self.line += 1;
+                    continue;
+                }
+                if self.pos + 3 < self.len
+                    && self.byte(self.pos) == b'\\'
+                    && self.byte(self.pos + 1) == b'r'
+                    && self.byte(self.pos + 2) == b'\\'
+                    && self.byte(self.pos + 3) == b'n'
+                {
+                    self.pos += 4;
+                    self.line += 1;
+                    continue;
+                }
+                // A bare quote here is the JSON string's closing quote:
+                // end of the text, not a record. Record where it is so
+                // transduce can find the `"header":` after it.
+                if self.byte(self.pos) == b'"' {
+                    self.end_pos = self.pos;
+                    self.saw_close = true;
+                    return None;
+                }
+                // A raw LF/CR pair (cannot occur in valid JSON; defensive).
+                let c = self.byte(self.pos);
+                if c == b'\n' {
+                    self.pos += 1;
+                    self.line += 1;
+                    continue;
+                }
+                if c == b'\r' && self.pos + 1 < self.len && self.byte(self.pos + 1) == b'\n' {
+                    self.pos += 2;
+                    self.line += 1;
+                    continue;
+                }
                 break;
+            } else {
+                let c = self.byte(self.pos);
+                if c == b'\n' {
+                    self.pos += 1;
+                    self.line += 1;
+                } else if c == b'\r' && self.pos + 1 < self.len && self.byte(self.pos + 1) == b'\n'
+                {
+                    self.pos += 2;
+                    self.line += 1;
+                } else {
+                    break;
+                }
             }
         }
         self.cur_line = self.line;
@@ -640,11 +1164,23 @@ impl Parser {
         let mut first_quoted = false;
         let mut out_after_w: usize = 0;
         loop {
-            if self.out.overflow || self.overflow {
+            if self.out.overflow || self.overflow || self.failed {
                 return None;
             }
-            quoted_last = self.pos < self.len && self.byte(self.pos) == b'"';
-            let vlen = if quoted_last {
+            quoted_last = if ESC {
+                self.pos + 1 < self.len
+                    && self.byte(self.pos) == b'\\'
+                    && self.byte(self.pos + 1) == b'"'
+            } else {
+                self.pos < self.len && self.byte(self.pos) == b'"'
+            };
+            let vlen = if ESC {
+                if quoted_last {
+                    self.read_quoted_esc()
+                } else {
+                    self.read_unquoted_esc(0)
+                }
+            } else if quoted_last {
                 self.read_quoted_json()
             } else {
                 self.read_unquoted_json(0)
@@ -666,7 +1202,7 @@ impl Parser {
             }
             self.out.lit(b"\",\"");
         }
-        if self.out.overflow || self.overflow {
+        if self.out.overflow || self.overflow || self.failed {
             return None;
         }
         // A record with a single empty unquoted field is skipped.
@@ -691,16 +1227,22 @@ impl Parser {
             }
         }
         self.out.u8(b']');
-        if self.out.overflow || self.overflow {
+        if self.out.overflow || self.overflow || self.failed {
             return None;
         }
         Some((n, quoted_last, false))
     }
 
-    /// Parses one case's text (UTF-8 bytes at `text_ptr`) and writes its
-    /// answer object `{"columns":...,"rows":[...],"errors":[...]}` to the
-    /// output. Returns false on overflow (caller falls back to JS).
-    fn parse_case(&mut self, text_ptr: usize, text_len: usize, header: bool) -> bool {
+    /// Parses one case's text (UTF-8 bytes at `text_ptr`, or the raw JSON
+    /// string body when ESC) and writes its answer object
+    /// `{"columns":...,"rows":[...],"errors":[...]}` to the output.
+    /// Returns false on overflow or failure (caller falls back to JS).
+    fn parse_case<const ESC: bool>(
+        &mut self,
+        text_ptr: usize,
+        text_len: usize,
+        header: bool,
+    ) -> bool {
         self.t = text_ptr as *const u8;
         self.len = text_len;
         self.pos = 0;
@@ -712,31 +1254,46 @@ impl Parser {
         self.err_pos = 0;
         self.err_count = 0;
         self.overflow = false;
+        self.failed = false;
+        self.saw_close = false;
+        self.end_pos = 0;
         self.scan_base = 0;
         self.scan_end = 0;
         self.scan_unq = 0;
         self.scan_quo = 0;
-        // A U+FEFF at the very start is dropped.
+        // A U+FEFF at the very start is dropped. In escaped form it is
+        // the raw bytes EF BB BF (as the generator writes it) or the
+        // escape `\ufeff`.
         if text_len >= 3
             && unsafe { *self.t == 0xEF && *self.t.add(1) == 0xBB && *self.t.add(2) == 0xBF }
         {
             self.pos = 3;
+        } else if ESC && text_len >= 6 && self.byte(0) == b'\\' && self.byte(1) == b'u' {
+            let h = |c: u8| -> Option<u32> { hex_val(c) };
+            match (h(self.byte(2)), h(self.byte(3)), h(self.byte(4)), h(self.byte(5))) {
+                (Some(a), Some(b), Some(c), Some(d))
+                    if (a << 12) | (b << 8) | (c << 4) | d == 0xFEFF =>
+                {
+                    self.pos = 6;
+                }
+                _ => {}
+            }
         }
         self.out.lit(b"{\"columns\":");
         if header {
             // Find the first filed record: it is the columns.
             loop {
                 let out_before = self.out.pos;
-                match self.parse_record_out(None, out_before) {
+                match self.parse_record_out::<ESC>(None, out_before) {
                     None => {
-                        if self.overflow || self.out.overflow {
+                        if self.overflow || self.out.overflow || self.failed {
                             return false;
                         }
                         // No records at all.
                         self.out.lit(b"[],\"rows\":[],\"errors\":[");
                         self.out.bytes(self.err_ptr as *const u8, self.err_pos);
                         self.out.lit(b"]}");
-                        return !self.out.overflow && !self.overflow;
+                        return !self.out.overflow && !self.overflow && !self.failed;
                     }
                     Some((n, _q, skipped)) => {
                         if skipped {
@@ -756,16 +1313,16 @@ impl Parser {
             // Find the first filed record: it is the first row.
             loop {
                 let out_before = self.out.pos;
-                match self.parse_record_out(None, out_before) {
+                match self.parse_record_out::<ESC>(None, out_before) {
                     None => {
-                        if self.overflow || self.out.overflow {
+                        if self.overflow || self.out.overflow || self.failed {
                             return false;
                         }
                         // No records at all.
                         self.out.lit(b"],\"errors\":[");
                         self.out.bytes(self.err_ptr as *const u8, self.err_pos);
                         self.out.lit(b"]}");
-                        return !self.out.overflow && !self.overflow;
+                        return !self.out.overflow && !self.overflow && !self.failed;
                     }
                     Some((n, _q, skipped)) => {
                         if skipped {
@@ -786,9 +1343,9 @@ impl Parser {
             if self.rows_len > 0 {
                 self.out.u8(b',');
             }
-            match self.parse_record_out(Some(self.width), out_before) {
+            match self.parse_record_out::<ESC>(Some(self.width), out_before) {
                 None => {
-                    if self.overflow || self.out.overflow {
+                    if self.overflow || self.out.overflow || self.failed {
                         return false;
                     }
                     // End of text: drop the row separator written above.
@@ -806,14 +1363,9 @@ impl Parser {
         self.out.lit(b"],\"errors\":[");
         self.out.bytes(self.err_ptr as *const u8, self.err_pos);
         self.out.lit(b"]}");
-        !self.out.overflow && !self.overflow
+        !self.out.overflow && !self.overflow && !self.failed
     }
 }
-
-// ===========================================================================
-// JSON string unescaping (for the cases.json text values) and the two
-// exported entry points.
-// ===========================================================================
 
 fn hex_val(b: u8) -> Option<u32> {
     match b {
@@ -863,165 +1415,10 @@ fn push_utf8(dst: *mut u8, mut pos: usize, cap: usize, cp: u32) -> Option<usize>
     Some(pos)
 }
 
-/// Unescape the JSON string starting at `from` (the opening `"` itself).
-/// Writes the unescaped bytes to `dst` (at most `cap` bytes). Returns (byte
-/// length, position just past the closing quote), or None when malformed /
-/// too big. Unescaping only shrinks, so `dst` may overlap the source at or
-/// after `from + 1` (in-place): the write never overtakes the read.
-fn json_unescape(
-    base: *const u8,
-    from: usize,
-    end: usize,
-    dst: *mut u8,
-    cap: usize,
-) -> Option<(usize, usize)> {
-    let mut o = 0usize;
-    let mut p = from + 1; // skip the opening quote
-    loop {
-        let d = unsafe { find2(base, p, end, b'\\', b'"') };
-        if d >= end {
-            return None; // unterminated string
-        }
-        // plain run [p, d)
-        if d > p {
-            if o + (d - p) > cap {
-                return None;
-            }
-            unsafe {
-                core::ptr::copy_nonoverlapping(base.add(p), dst.add(o), d - p);
-            }
-            o += d - p;
-        }
-        if unsafe { *base.add(d) } == b'"' {
-            return Some((o, d + 1));
-        }
-        // backslash escape at d; the escaped byte is at d+1
-        if d + 1 >= end {
-            return None;
-        }
-        let e = unsafe { *base.add(d + 1) };
-        match e {
-            b'"' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'"' };
-                o += 1;
-                p = d + 2;
-            }
-            b'\\' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'\\' };
-                o += 1;
-                p = d + 2;
-            }
-            b'/' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'/' };
-                o += 1;
-                p = d + 2;
-            }
-            b'b' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = 0x08 };
-                o += 1;
-                p = d + 2;
-            }
-            b'f' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = 0x0c };
-                o += 1;
-                p = d + 2;
-            }
-            b'n' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'\n' };
-                o += 1;
-                p = d + 2;
-            }
-            b'r' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'\r' };
-                o += 1;
-                p = d + 2;
-            }
-            b't' => {
-                if o + 1 > cap {
-                    return None;
-                }
-                unsafe { *dst.add(o) = b'\t' };
-                o += 1;
-                p = d + 2;
-            }
-            b'u' => {
-                if d + 6 > end {
-                    return None;
-                }
-                let mut v: u32 = 0;
-                for k in 0..4 {
-                    let h = match hex_val(unsafe { *base.add(d + 2 + k) }) {
-                        Some(h) => h,
-                        None => return None,
-                    };
-                    v = (v << 4) | h;
-                }
-                let mut adv = 6usize;
-                let cp: u32;
-                if (0xD800..0xDC00).contains(&v) {
-                    // high surrogate: combine with a following \uDC00-\uDFFF
-                    if d + 12 <= end
-                        && unsafe { *base.add(d + 6) } == b'\\'
-                        && unsafe { *base.add(d + 7) } == b'u'
-                    {
-                        let mut lo: u32 = 0;
-                        let mut ok = true;
-                        for k in 0..4 {
-                            match hex_val(unsafe { *base.add(d + 8 + k) }) {
-                                Some(h) => lo = (lo << 4) | h,
-                                None => ok = false,
-                            }
-                        }
-                        if ok && (0xDC00..0xE000).contains(&lo) {
-                            cp = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
-                            adv = 12;
-                        } else {
-                            // Lone high surrogate: UTF-8 cannot hold it, and
-                            // the JS baseline keeps it as \ud800, so the
-                            // whole file must fall back to JS instead.
-                            return None;
-                        }
-                    } else {
-                        // Lone high surrogate: fall back to JS (see above).
-                        return None;
-                    }
-                } else if (0xDC00..0xE000).contains(&v) {
-                    // Lone low surrogate: fall back to JS (see above).
-                    return None;
-                } else {
-                    cp = v;
-                }
-                o = push_utf8(dst, o, cap, cp)?;
-                p = d + adv;
-            }
-            _ => return None, // not a JSON escape: let the JS fallback handle it
-        }
-    }
-}
-
 /// Whole-file transducer: cases.json bytes at IN_PTR -> answers.json bytes
-/// at OUT_PTR. Returns the output length, or FAIL.
+/// at OUT_PTR. Returns the output length, or FAIL. Each case's text is
+/// parsed directly in its JSON-escaped form (zero-prescan); no unescape
+/// pass runs first.
 #[no_mangle]
 pub extern "C" fn transduce(in_ptr: u32, in_len: u32) -> u32 {
     let in_len = in_len as usize;
@@ -1052,16 +1449,27 @@ pub extern "C" fn transduce(in_ptr: u32, in_len: u32) -> u32 {
             break;
         }
         let str_start = t + 7; // the opening quote of the string value
-        // Unescape IN PLACE: the text is written over its own JSON form.
-        let dst = unsafe { base.add(str_start + 1) as *mut u8 };
-        let (text_len, after_text) =
-            match json_unescape(base, str_start, in_len, dst, in_len - str_start) {
-                Some(r) => r,
-                None => return FAIL,
-            };
-        // The header flag follows the text value in this generator's format.
-        let h = unsafe { find_sub(base, after_text, in_len, b"\"header\":") };
+        // The header flag is needed BEFORE parsing, and it follows the
+        // text value in this generator's format: `...","header":true`.
+        // Find `"header":`, then step back over `,`/whitespace to the
+        // closing quote of the text value.
+        let h = unsafe { find_sub(base, str_start, in_len, b"\"header\":") };
         if h >= in_len {
+            return FAIL;
+        }
+        let mut closing = h;
+        loop {
+            if closing <= str_start {
+                return FAIL;
+            }
+            closing -= 1;
+            let c = unsafe { *base.add(closing) };
+            if c == b'"' {
+                break;
+            }
+            if c == b',' || c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                continue;
+            }
             return FAIL;
         }
         let mut q = h + 9;
@@ -1099,11 +1507,19 @@ pub extern "C" fn transduce(in_ptr: u32, in_len: u32) -> u32 {
             p.out.u8(b',');
         }
         first = false;
-        // The parser reads the unescaped text from its in-place location.
-        if !p.parse_case(in_ptr as usize + str_start + 1, text_len, header) {
+        // Parse the text in place, in its JSON-escaped form: it starts
+        // just past the opening quote and ends at its closing quote.
+        let text_start = str_start + 1;
+        if !p.parse_case::<true>(in_ptr as usize + text_start, in_len - text_start, header) {
             return FAIL;
         }
-        scan = after_text;
+        // The parser must have stopped at exactly the closing quote
+        // found above; anything else means the input is not shaped the
+        // way this transducer assumes.
+        if !p.saw_close || text_start + p.end_pos != closing {
+            return FAIL;
+        }
+        scan = closing + 1;
         if p.out.overflow {
             return FAIL;
         }
@@ -1124,7 +1540,7 @@ pub extern "C" fn run_case(text_ptr: u32, text_len: u32, header: u32) -> u32 {
         return FAIL;
     }
     let mut p = Parser::new();
-    if !p.parse_case(text_ptr as usize, text_len, header != 0) {
+    if !p.parse_case::<false>(text_ptr as usize, text_len, header != 0) {
         return FAIL;
     }
     p.out.pos as u32

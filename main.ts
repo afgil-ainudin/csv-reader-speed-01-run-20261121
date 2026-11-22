@@ -4,11 +4,13 @@
 // and stringifying the answers. Outside a container MAKEFUN_INPUT_DIR and
 // MAKEFUN_OUTPUT_DIR stand in for /input and /output.
 //
-// Round 3 (streaming kernel): the WASM transducer unescapes each case's
-// text in place and streams the answers JSON straight to the output while
-// it scans (two-stage SIMD masks, no per-record scratch). Measured locally:
-// transduce ~41.5 ms for the 6 practice cases (round 2: ~65 ms); practice
-// 6/6 byte-identical, differential fuzz 1,800 cases 0 mismatches.
+// Round 4 (zero-prescan kernel): the WASM transducer parses each case's
+// text directly in its JSON-escaped form — no unescape pass — and streams
+// the answers JSON straight to the output while it scans (two-stage SIMD
+// masks, no per-record scratch). Measured locally: transduce ~36 ms for
+// the 6 practice cases (round 3: ~44 ms); practice 6/6 byte-identical,
+// differential fuzz 1,500 random cases + 38 batch files + 23 hand-crafted
+// `\u`/surrogate/BOM cases, 0 mismatches.
 
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
